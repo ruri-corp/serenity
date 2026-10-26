@@ -244,6 +244,11 @@ impl Shard {
         self.session_id.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_session_id_for_test(&mut self, session_id: Option<String>) {
+        self.session_id = session_id;
+    }
+
     #[inline]
     #[instrument(skip(self))]
     pub fn set_activity(&mut self, activity: Option<ActivityData>) {

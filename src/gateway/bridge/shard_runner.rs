@@ -400,7 +400,15 @@ impl ShardRunner {
                             // Don't spam reattempts on internet connection loss
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                            return Ok((None, None, false));
+                            // The failed resume left the shard in `Connecting` with the dead
+                            // socket still attached, so `run()` must hand the shard back to the
+                            // manager instead of polling that socket again: `is_connecting()`
+                            // would otherwise suppress the restart and the loop would spin.
+                            return Ok((
+                                None,
+                                Some(ShardAction::Reconnect(ReconnectType::Reidentify)),
+                                false,
+                            ));
                         }
                     },
                 }
@@ -497,4 +505,172 @@ pub struct ShardRunnerOptions {
     #[cfg(feature = "cache")]
     pub cache: Arc<Cache>,
     pub http: Arc<Http>,
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::*;
+    use crate::gateway::{ConnectionStage, ShardManagerOptions};
+    use crate::model::gateway::{GatewayIntents, ShardInfo};
+    use crate::model::id::ShardId;
+
+    /// Makes dropping `stream` send a TCP reset instead of a FIN, which is what the gateway
+    /// client observes when the network goes away under it. A zero `SO_LINGER` timeout never
+    /// blocks the dropping thread.
+    fn reset_on_drop(stream: &tokio::net::TcpStream) {
+        use std::os::fd::AsRawFd;
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        // SAFETY: the descriptor belongs to a live socket owned by `stream`, and `linger` is a
+        // correctly sized, initialised option value for the duration of the call.
+        let status = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(status, 0, "setsockopt(SO_LINGER) failed");
+    }
+
+    /// A gateway stand-in for one connection: finishes the websocket handshake, sends a Hello
+    /// whose heartbeat interval outlasts the test's budget, waits for the client's Identify,
+    /// asks for a heartbeat so the shard records a recent send, and then resets the TCP
+    /// connection without a close frame so the client observes an IO error exactly as it does
+    /// when the network drops.
+    ///
+    /// The interval matters: a spinning runner never yields, which also starves the runtime's
+    /// timer, so a regression only surfaces once the runner's own heartbeat check trips at this
+    /// interval. One minute keeps that failure bounded while staying well above the budget.
+    async fn serve_then_reset(listener: TcpListener) {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut ws = tokio_tungstenite::accept_async(stream).await.expect("handshake");
+        ws.send(Message::Text(
+            r#"{"op":10,"s":null,"t":null,"d":{"heartbeat_interval":60000}}"#.into(),
+        ))
+        .await
+        .expect("send hello");
+        let identify = ws.next().await.expect("identify").expect("identify frame");
+        assert!(identify.is_text(), "expected the client's identify payload");
+        ws.send(Message::Text(r#"{"op":1,"s":null,"t":null,"d":null}"#.into()))
+            .await
+            .expect("send heartbeat request");
+        let heartbeat = ws.next().await.expect("heartbeat").expect("heartbeat frame");
+        assert!(heartbeat.is_text(), "expected the client's heartbeat payload");
+        reset_on_drop(ws.get_ref());
+        drop(ws);
+    }
+
+    /// Regression for the hot loop after a network cut: resuming fails while the shard is in
+    /// `Connecting`, and the runner must hand the shard back to the manager rather than keep
+    /// polling the dead socket.
+    ///
+    /// The runner runs on its own worker and is judged from the test thread, and the runtime is
+    /// abandoned with a bounded wait instead of joining a worker that may still be busy. Before
+    /// the fix this test failed after the one-minute heartbeat interval, with the test binary
+    /// pinned at 100% CPU until then.
+    #[test]
+    fn failed_resume_while_connecting_restarts_instead_of_spinning() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let live_url = format!("ws://{}", listener.local_addr().expect("addr"));
+            // A port that was bound and released refuses connections immediately, which is
+            // what the resume's reconnect looks like while the network is down.
+            let dead_url = {
+                let parked = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                format!("ws://{}", parked.local_addr().expect("addr"))
+            };
+            let server = tokio::spawn(serve_then_reset(listener));
+
+            let ws_url = Arc::new(Mutex::new(live_url));
+            let ws_proxy = Arc::new(Mutex::new(None));
+            let info = ShardInfo { id: ShardId(0), total: 1 };
+            let mut shard = Shard::new(
+                Arc::clone(&ws_url),
+                Arc::clone(&ws_proxy),
+                "token",
+                info,
+                GatewayIntents::empty(),
+                None,
+            )
+            .await
+            .expect("connect");
+            // A live session makes the IO error take the resume path.
+            shard.set_session_id_for_test(Some("session".to_string()));
+            *ws_url.lock().await = dead_url;
+
+            let data = Arc::new(RwLock::new(TypeMap::new()));
+            let http = Arc::new(Http::new("token"));
+            #[cfg(feature = "cache")]
+            let cache = Arc::new(Cache::new());
+            let (manager, _return_value_rx) = ShardManager::new(ShardManagerOptions {
+                data: Arc::clone(&data),
+                event_handlers: vec![],
+                raw_event_handlers: vec![],
+                #[cfg(feature = "framework")]
+                framework: Arc::new(std::sync::OnceLock::new()),
+                shard_index: 0,
+                shard_init: 1,
+                shard_total: 1,
+                #[cfg(feature = "voice")]
+                voice_manager: None,
+                ws_url: Arc::clone(&ws_url),
+                ws_proxy,
+                #[cfg(feature = "cache")]
+                cache: Arc::clone(&cache),
+                http: Arc::clone(&http),
+                intents: GatewayIntents::empty(),
+                presence: None,
+            });
+            let mut runner = ShardRunner::new(ShardRunnerOptions {
+                data,
+                event_handlers: vec![],
+                raw_event_handlers: vec![],
+                #[cfg(feature = "framework")]
+                framework: None,
+                manager,
+                shard,
+                #[cfg(feature = "voice")]
+                voice_manager: None,
+                #[cfg(feature = "cache")]
+                cache,
+                http,
+            });
+            let runner_task = tokio::spawn(async move {
+                let result = runner.run().await;
+                (result, runner.shard.stage(), runner.shard.session_id().cloned())
+            });
+
+            // The 1s resume backoff plus the manager's 5s shutdown wait fit comfortably in this
+            // budget; the spinning runner never returned at all.
+            let outcome = tokio::time::timeout(Duration::from_secs(30), runner_task).await;
+            tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("gateway stand-in must have finished")
+                .expect("server task");
+            outcome
+        });
+        runtime.shutdown_timeout(Duration::from_secs(1));
+
+        let (result, stage, session_id) = outcome
+            .expect("runner must hand the shard back instead of spinning")
+            .expect("runner task");
+        result.expect("runner exits cleanly after requesting a restart");
+        assert_eq!(stage, ConnectionStage::Connecting);
+        assert_eq!(session_id.as_deref(), Some("session"));
+    }
 }
