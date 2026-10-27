@@ -57,6 +57,9 @@ impl ConnectionAttemptId {
     /// The policy chooses its stability interval and calls this after that
     /// interval. A retired connection's timer cannot reset replacement state.
     /// Do not call from `try_identify`, which already holds the admission lock.
+    /// Release every policy lock before calling this method. For example, a
+    /// stability timer copies the attempt out of its policy state, drops that
+    /// guard, and only then calls `mark_stable()`. See [`IdentifyGate`]'s lock order.
     #[must_use]
     pub fn mark_stable(&self) -> bool {
         let Some(state) = self.state.upgrade() else { return false };
@@ -85,6 +88,16 @@ impl ConnectionAttemptId {
 /// check may read REST and returns an absolute cooldown deadline. The synchronous
 /// check must atomically validate and charge, without network I/O or waiting.
 /// READY is an observation, never permission to replenish quota.
+///
+/// # Lock order
+///
+/// The coordinator holds its admission mutex while calling `try_identify` so
+/// validation, charging, spacing and retirement cannot race. Policy locks may
+/// be acquired inside that callback: the order is coordinator, then policy.
+/// Never call [`ConnectionAttemptId::mark_stable`] or any manager operation
+/// while holding a policy lock, including from a stability timer or preflight.
+/// Copy the required attempt out, release the policy guard, then mark it stable.
+/// `session_ready` is called without the coordinator mutex held.
 #[async_trait]
 pub trait IdentifyGate: Send + Sync {
     /// Consult policy before connecting; repeated calls must not restart a cooldown.
@@ -333,5 +346,73 @@ mod tests {
             IdentifyAdmission::RequeueForAdmission
         ));
         assert!(!coordinator.begin(shard).id.is_active());
+    }
+
+    #[test]
+    fn stability_timer_releases_policy_lock_before_entering_coordinator() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        struct Policy {
+            ready: Mutex<Option<ConnectionAttemptId>>,
+            admission_entered: mpsc::Sender<()>,
+        }
+        #[async_trait]
+        impl IdentifyGate for Policy {
+            async fn before_fresh_session(&self, _: ShardInfo, _: u32) -> IdentifyDecision {
+                IdentifyDecision::Proceed
+            }
+            fn try_identify(&self, _: ShardInfo, _: ConnectionAttemptId) -> IdentifyAdmission {
+                // The coordinator lock is held, and the timer holds the policy
+                // lock. Signal this exact interleaving before trying the latter.
+                self.admission_entered.send(()).unwrap();
+                let _policy = self.ready.lock().unwrap();
+                IdentifyAdmission::Send
+            }
+            fn session_ready(&self, _: ShardInfo, attempt: ConnectionAttemptId) {
+                *self.ready.lock().unwrap() = Some(attempt);
+            }
+        }
+
+        let budget = Duration::from_secs(3);
+        let (admission_tx, admission_rx) = mpsc::channel();
+        let policy = Arc::new(Policy {
+            ready: Mutex::new(None),
+            admission_entered: admission_tx,
+        });
+        let coordinator = Arc::new(IdentifyCoordinator::new(Some(policy.clone())));
+        let ready_shard = ShardInfo::new(ShardId(0), 2);
+        let ready = coordinator.begin(ready_shard);
+        coordinator.ready(ready_shard, &ready.id);
+        let sending_shard = ShardInfo::new(ShardId(1), 2);
+        let sending = coordinator.begin(sending_shard);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (stable_tx, stable_rx) = mpsc::channel();
+        let timer = thread::spawn(move || {
+            let policy_guard = policy.ready.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            admission_rx.recv_timeout(budget).unwrap();
+            let attempt = policy_guard.as_ref().unwrap().clone();
+            drop(policy_guard); // Required order for Ruri's stability timer.
+            stable_tx.send(attempt.mark_stable()).unwrap();
+        });
+        locked_rx.recv_timeout(budget).unwrap();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let admitting = Arc::clone(&coordinator);
+        let sender = thread::spawn(move || {
+            sent_tx
+                .send(matches!(
+                    admitting.admit(sending_shard, &sending.id),
+                    IdentifyAdmission::Send
+                ))
+                .unwrap();
+        });
+        // Timeouts make a lock-order regression fail rather than hanging the
+        // test harness. Join only after both workers have acknowledged progress.
+        assert!(sent_rx.recv_timeout(budget).expect("admission deadlocked"));
+        assert!(stable_rx.recv_timeout(budget).expect("stability timer deadlocked"));
+        sender.join().unwrap();
+        timer.join().unwrap();
+        assert_eq!(coordinator.streak(sending_shard.id), 1);
     }
 }
