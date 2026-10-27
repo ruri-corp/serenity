@@ -46,6 +46,7 @@ mod shard_messenger;
 mod shard_queuer;
 mod shard_runner;
 mod shard_runner_message;
+mod task_group;
 #[cfg(feature = "voice")]
 mod voice;
 

@@ -22,6 +22,8 @@ pub(crate) mod dispatch;
 mod error;
 #[cfg(feature = "gateway")]
 mod event_handler;
+#[cfg(all(test, feature = "gateway"))]
+mod lifecycle_tests;
 
 use std::future::IntoFuture;
 use std::ops::Range;

@@ -6,12 +6,13 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures::channel::mpsc::{self, UnboundedReceiver as Receiver, UnboundedSender as Sender};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{info, instrument, warn};
 use typemap_rev::TypeMap;
 
+use super::task_group::GatewayTasks;
 #[cfg(feature = "voice")]
 use super::VoiceGatewayManager;
 use super::{ShardId, ShardQueuer, ShardQueuerMessage, ShardRunnerInfo};
@@ -23,7 +24,6 @@ use crate::framework::Framework;
 use crate::gateway::{ConnectionStage, GatewayError, PresenceData};
 use crate::http::Http;
 use crate::internal::prelude::*;
-use crate::internal::tokio::spawn_named;
 use crate::model::gateway::GatewayIntents;
 
 /// A manager for handling the status of shards by starting them, restarting them, and stopping
@@ -97,7 +97,8 @@ use crate::model::gateway::GatewayIntents;
 /// [`Client`]: crate::Client
 #[derive(Debug)]
 pub struct ShardManager {
-    return_value_tx: Mutex<Sender<Result<(), GatewayError>>>,
+    return_value_tx: Sender<Result<(), GatewayError>>,
+    pub(super) tasks: GatewayTasks,
     /// The shard runners currently managed.
     ///
     /// **Note**: It is highly unrecommended to mutate this yourself unless you need to. Instead
@@ -130,7 +131,8 @@ impl ShardManager {
         let (shutdown_send, shutdown_recv) = mpsc::unbounded();
 
         let manager = Arc::new(Self {
-            return_value_tx: Mutex::new(return_value_tx),
+            return_value_tx,
+            tasks: GatewayTasks::new(),
             shard_index: AtomicU32::new(opt.shard_index),
             shard_init: AtomicU32::new(opt.shard_init),
             shard_queuer: shard_queue_tx,
@@ -163,7 +165,7 @@ impl ShardManager {
             presence: opt.presence,
         };
 
-        spawn_named("shard_queuer::run", async move {
+        manager.tasks.spawn("shard_queuer::run", async move {
             shard_queuer.run().await;
         });
 
@@ -323,7 +325,39 @@ impl ShardManager {
 
         // this message is received by Client::start_connection, which lets the main thread know
         // and finally return from Client::start
-        drop(self.return_value_tx.lock().await.unbounded_send(Ok(())));
+        drop(self.return_value_tx.unbounded_send(Ok(())));
+    }
+
+    /// Permanently stops this manager and joins all its Gateway connection tasks.
+    ///
+    /// Unlike [`Self::shutdown_all`], this also stops pending connection attempts
+    /// and retries when no shard has connected yet. The manager cannot be reused
+    /// afterwards. Initial startup and ordinary shard restarts do not call this.
+    ///
+    /// The stop signal survives cancellation of this future. Call this method
+    /// again to finish waiting, or [`Self::shutdown_terminal_force`] to abort and
+    /// join the owned tasks. Neither operation relies on the proxy responding.
+    /// `Client::start` is woken immediately; this method's return, not the client
+    /// task's return alone, proves that all connection tasks have finished.
+    ///
+    /// Call from outside the manager's connection tasks: a task cannot join itself.
+    pub async fn shutdown_terminal(&self) {
+        self.tasks.close(false);
+        drop(self.return_value_tx.unbounded_send(Ok(())));
+        self.tasks.join().await;
+        self.runners.lock().await.clear();
+    }
+
+    /// Aborts and joins the entire connection task group after permanent shutdown.
+    ///
+    /// This is an exceptional fallback for a caller whose normal shutdown budget
+    /// expired. Canceling this wait retains task ownership; it can be called again.
+    /// Like [`Self::shutdown_terminal`], this must be called outside the group.
+    pub async fn shutdown_terminal_force(&self) {
+        self.tasks.close(true);
+        drop(self.return_value_tx.unbounded_send(Ok(())));
+        self.tasks.join().await;
+        self.runners.lock().await.clear();
     }
 
     #[instrument(skip(self))]
@@ -342,7 +376,7 @@ impl ShardManager {
     }
 
     pub async fn return_with_value(&self, ret: Result<(), GatewayError>) {
-        if let Err(e) = self.return_value_tx.lock().await.send(ret).await {
+        if let Err(e) = self.return_value_tx.unbounded_send(ret) {
             tracing::warn!("failed to send return value: {}", e);
         }
     }

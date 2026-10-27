@@ -10,7 +10,6 @@ use futures::SinkExt;
 #[cfg(feature = "client")]
 use futures::StreamExt;
 use tokio::net::TcpStream;
-#[cfg(feature = "client")]
 use tokio::time::{timeout, Duration};
 #[cfg(feature = "client")]
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -100,11 +99,20 @@ pub struct WsClient(WebSocketStream<MaybeTlsStream<TcpStream>>);
 
 #[cfg(feature = "client")]
 const TIMEOUT: Duration = Duration::from_millis(500);
+// Bound TCP, proxy CONNECT, TLS and WebSocket handshakes as one operation.
+// Terminal Gateway shutdown cancels the operation independently of this limit.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "client")]
 const DECOMPRESSION_MULTIPLIER: usize = 3;
 
 impl WsClient {
     pub(crate) async fn connect(url: Url, proxy: Option<Url>) -> Result<Self> {
+        timeout(CONNECT_TIMEOUT, Self::connect_inner(url, proxy))
+            .await
+            .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "Gateway connection timed out"))?
+    }
+
+    async fn connect_inner(url: Url, proxy: Option<Url>) -> Result<Self> {
         let config =
             WebSocketConfig { max_message_size: None, max_frame_size: None, ..Default::default() };
         let (stream, _) = match proxy {
