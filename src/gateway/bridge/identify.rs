@@ -104,7 +104,10 @@ pub trait IdentifyGate: Send + Sync {
     async fn before_fresh_session(&self, shard: ShardInfo, streak: u32) -> IdentifyDecision;
     /// Validate admission and charge an attempted write in one atomic operation.
     fn try_identify(&self, shard: ShardInfo, attempt: ConnectionAttemptId) -> IdentifyAdmission;
-    /// Observe READY for the active connection, without blocking the runner.
+    /// Observe READY or successful RESUMED for the active connection.
+    ///
+    /// Each recovered connection starts a new continuous stability interval;
+    /// its prior attempt's timer is invalid. This callback must not block the runner.
     fn session_ready(&self, shard: ShardInfo, attempt: ConnectionAttemptId);
 }
 
@@ -380,7 +383,7 @@ mod tests {
             ready: Mutex::new(None),
             admission_entered: admission_tx,
         });
-        let coordinator = Arc::new(IdentifyCoordinator::new(Some(policy.clone())));
+        let coordinator = Arc::new(IdentifyCoordinator::new(Some(Arc::<Policy>::clone(&policy))));
         let ready_shard = ShardInfo::new(ShardId(0), 2);
         let ready = coordinator.begin(ready_shard);
         coordinator.ready(ready_shard, &ready.id);

@@ -30,6 +30,7 @@ struct Gate {
     expire_first: bool,
     valid_until: SyncMutex<Option<Instant>>,
     attempts: SyncMutex<Vec<ConnectionAttemptId>>,
+    observations: SyncMutex<Vec<ConnectionAttemptId>>,
 }
 
 impl Gate {
@@ -48,6 +49,7 @@ impl Gate {
             expire_first: false,
             valid_until: SyncMutex::new(None),
             attempts: SyncMutex::new(vec![]),
+            observations: SyncMutex::new(vec![]),
         }
     }
 }
@@ -99,6 +101,7 @@ impl IdentifyGate for Gate {
 
     fn session_ready(&self, _: ShardInfo, attempt: ConnectionAttemptId) {
         if attempt.is_active() {
+            self.observations.lock().unwrap().push(attempt);
             self.ready.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -345,5 +348,68 @@ async fn identify_gate_io_loss_and_incomplete_handshake_keep_resumable_state() {
     stop(&manager, task).await;
     assert_eq!(proxy.identifies.load(Ordering::SeqCst), 1);
     assert_eq!(gate.charged.load(Ordering::SeqCst), 1);
+    proxy.finish().await;
+}
+
+#[tokio::test]
+async fn ordinary_shutdown_during_resume_wait_or_connect_stops_before_return() {
+    for during_connect in [false, true] {
+        let proxy = Proxy::new(RESUME_OUTAGE).await;
+        let (manager, task) = gated_start(&proxy, Arc::new(Gate::new(1)));
+        until(|| proxy.connects.load(Ordering::SeqCst) >= 2).await;
+        if during_connect {
+            proxy.mode.store(HANG, Ordering::SeqCst);
+            until(|| proxy.connects.load(Ordering::SeqCst) >= 3).await;
+        }
+        timeout(BUDGET, manager.shutdown_all()).await.unwrap();
+        timeout(BUDGET, task).await.unwrap().unwrap().unwrap();
+        let resumes_at_return = proxy.resumes.load(Ordering::SeqCst);
+        proxy.stays_stopped().await;
+        assert_eq!(proxy.resumes.load(Ordering::SeqCst), resumes_at_return);
+        timeout(BUDGET, manager.shutdown_terminal()).await.unwrap();
+        proxy.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn ordinary_restart_during_resume_outage_does_not_leave_old_worker() {
+    let proxy = Proxy::new(RESUME_OUTAGE).await;
+    let gate = Arc::new(Gate::new(2));
+    let (manager, task) = gated_start(&proxy, Arc::clone(&gate));
+    until(|| proxy.connects.load(Ordering::SeqCst) >= 2).await;
+    timeout(BUDGET, manager.restart(ShardId(0))).await.unwrap();
+    proxy.mode.store(GATEWAY, Ordering::SeqCst);
+    until(|| proxy.identifies.load(Ordering::SeqCst) == 2).await;
+    // The explicit restart legitimately starts one new session. The old
+    // transport retry must not recover alongside that replacement.
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(proxy.resumes.load(Ordering::SeqCst), 0);
+    assert_eq!(proxy.identifies.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.charged.load(Ordering::SeqCst), 2);
+    stop(&manager, task).await;
+    proxy.stays_stopped().await;
+    proxy.finish().await;
+}
+
+#[tokio::test]
+async fn resumed_connection_exposes_a_new_stability_token_without_charging() {
+    let proxy = Proxy::new(RESUMABLE_INVALIDATION).await;
+    let gate = Arc::new(Gate::new(1));
+    let (manager, task) = gated_start(&proxy, Arc::clone(&gate));
+    until(|| gate.ready.load(Ordering::SeqCst) == 2).await;
+    let observations = gate.observations.lock().unwrap().clone();
+    assert_eq!(observations.len(), 2);
+    assert_ne!(observations[0].get(), observations[1].get());
+    assert!(!observations[0].is_active());
+    assert!(!observations[0].mark_stable());
+    assert!(observations[1].is_active());
+    // The caller owns the stability interval. This verifies eligibility of the
+    // recovered token; virtual-time state tests cover the retired timer fence.
+    assert!(observations[1].mark_stable());
+    assert_eq!(proxy.identifies.load(Ordering::SeqCst), 1);
+    assert_eq!(proxy.resumes.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.charged.load(Ordering::SeqCst), 1);
+    stop(&manager, task).await;
+    assert!(!observations[1].mark_stable());
     proxy.finish().await;
 }

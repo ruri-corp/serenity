@@ -1,7 +1,10 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 
 use futures::channel::mpsc::{self, UnboundedReceiver as Receiver, UnboundedSender as Sender};
+use futures::StreamExt;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::error::Error as TungsteniteError;
@@ -38,6 +41,8 @@ pub struct ShardRunner {
     manager: Arc<ShardManager>,
     attempt: AttemptGuard,
     resume_failures: u32,
+    stopped: bool,
+    deferred_messages: VecDeque<ShardRunnerMessage>,
     // channel to receive messages from the shard manager and dispatches
     runner_rx: Receiver<ShardRunnerMessage>,
     // channel to send messages to the shard runner from the shard manager
@@ -61,6 +66,8 @@ impl ShardRunner {
         Self {
             attempt,
             resume_failures: 0,
+            stopped: false,
+            deferred_messages: VecDeque::new(),
             runner_rx: rx,
             runner_tx: tx,
             data: opt.data,
@@ -109,6 +116,9 @@ impl ShardRunner {
         info!("[ShardRunner {:?}] Running", self.shard.shard_info());
 
         loop {
+            if self.stopped {
+                return Ok(());
+            }
             trace!("[ShardRunner {:?}] loop iteration started.", self.shard.shard_info());
             if !self.recv().await {
                 return Ok(());
@@ -128,6 +138,9 @@ impl ShardRunner {
 
             let pre = self.shard.stage();
             let (event, action, successful) = self.recv_event().await?;
+            if self.stopped {
+                return Ok(());
+            }
             let post = self.shard.stage();
 
             if post != pre {
@@ -189,13 +202,15 @@ impl ShardRunner {
                 None => {},
             }
 
+            if self.stopped {
+                return Ok(());
+            }
             if let Some(event) = event {
                 match &event {
-                    Event::Ready(_) => {
+                    Event::Ready(_) | Event::Resumed(_) => {
                         self.resume_failures = 0;
                         self.manager.identify.ready(self.shard.shard_info(), &self.attempt.id);
                     },
-                    Event::Resumed(_) => self.resume_failures = 0,
                     _ => {},
                 }
                 #[cfg(feature = "collector")]
@@ -383,7 +398,11 @@ impl ShardRunner {
     #[instrument(skip(self))]
     async fn recv(&mut self) -> bool {
         loop {
-            match self.runner_rx.try_next() {
+            let message = match self.deferred_messages.pop_front() {
+                Some(message) => Ok(Some(message)),
+                None => self.runner_rx.try_next(),
+            };
+            match message {
                 Ok(Some(value)) => {
                     if !self.handle_rx_value(value).await {
                         return false;
@@ -488,9 +507,34 @@ impl ShardRunner {
                 3 => 10,
                 _ => 30,
             };
-            tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
+            let shard_id = self.shard.shard_info().id;
+            if resume_step(
+                tokio::time::sleep(tokio::time::Duration::from_secs(seconds)),
+                &mut self.runner_rx,
+                &mut self.deferred_messages,
+                &self.manager,
+                shard_id,
+            )
+            .await
+            .is_none()
+            {
+                self.stopped = true;
+                return Ok(());
+            }
             self.resume_failures = self.resume_failures.saturating_add(1);
-            match self.shard.resume().await {
+            let resumed = resume_step(
+                Box::pin(self.shard.resume()),
+                &mut self.runner_rx,
+                &mut self.deferred_messages,
+                &self.manager,
+                shard_id,
+            )
+            .await;
+            let Some(resumed) = resumed else {
+                self.stopped = true;
+                return Ok(());
+            };
+            match resumed {
                 Ok(()) => {
                     self.attempt = self.manager.identify.begin(self.shard.shard_info());
                     return Ok(());
@@ -553,6 +597,38 @@ pub struct ShardRunnerOptions {
     #[cfg(feature = "cache")]
     pub cache: Arc<Cache>,
     pub http: Arc<Http>,
+}
+
+// Ordinary per-shard shutdown/restart does not close the terminal task group.
+// Service those controls during both retry sleeps and connection establishment.
+// Other messages retain their order and are replayed after recovery. The pinned
+// future keeps progressing when such a message arrives; it is not restarted.
+async fn resume_step<T>(
+    future: impl Future<Output = T>,
+    rx: &mut Receiver<ShardRunnerMessage>,
+    deferred: &mut VecDeque<ShardRunnerMessage>,
+    manager: &ShardManager,
+    shard_id: ShardId,
+) -> Option<T> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            message = rx.next() => match message {
+                Some(ShardRunnerMessage::Shutdown(id, _) | ShardRunnerMessage::Restart(id)) => {
+                    if id == shard_id {
+                        // The disconnected socket is dropped by the returning
+                        // runner; there is no live close handshake to wait for.
+                        manager.shutdown_finished(id);
+                        return None;
+                    }
+                },
+                Some(message) => deferred.push_back(message),
+                None => return None,
+            },
+            result = &mut future => return Some(result),
+        }
+    }
 }
 
 // Protocol, authentication and configuration errors are not transport outages.
