@@ -89,6 +89,8 @@ use crate::model::gateway::GatewayIntents;
 ///     # http,
 ///     intents: GatewayIntents::non_privileged(),
 ///     presence: None,
+///     identify_gate: None,
+///     ws_proxy: Arc::new(Mutex::new(None)),
 /// });
 /// # Ok(())
 /// # }
@@ -97,6 +99,7 @@ use crate::model::gateway::GatewayIntents;
 /// [`Client`]: crate::Client
 #[derive(Debug)]
 pub struct ShardManager {
+    pub(super) identify: super::identify::IdentifyCoordinator,
     return_value_tx: Sender<Result<(), GatewayError>>,
     pub(super) tasks: GatewayTasks,
     /// The shard runners currently managed.
@@ -131,6 +134,7 @@ impl ShardManager {
         let (shutdown_send, shutdown_recv) = mpsc::unbounded();
 
         let manager = Arc::new(Self {
+            identify: super::identify::IdentifyCoordinator::new(opt.identify_gate),
             return_value_tx,
             tasks: GatewayTasks::new(),
             shard_index: AtomicU32::new(opt.shard_index),
@@ -342,6 +346,7 @@ impl ShardManager {
     ///
     /// Call from outside the manager's connection tasks: a task cannot join itself.
     pub async fn shutdown_terminal(&self) {
+        self.identify.close();
         self.tasks.close(false);
         drop(self.return_value_tx.unbounded_send(Ok(())));
         self.tasks.join().await;
@@ -354,6 +359,7 @@ impl ShardManager {
     /// expired. Canceling this wait retains task ownership; it can be called again.
     /// Like [`Self::shutdown_terminal`], this must be called outside the group.
     pub async fn shutdown_terminal_force(&self) {
+        self.identify.close();
         self.tasks.close(true);
         drop(self.return_value_tx.unbounded_send(Ok(())));
         self.tasks.join().await;
@@ -384,6 +390,15 @@ impl ShardManager {
     pub fn shutdown_finished(&self, id: ShardId) {
         if let Err(e) = self.shard_shutdown_send.unbounded_send(id) {
             tracing::warn!("failed to notify about finished shutdown: {}", e);
+        }
+    }
+
+    // Called by the retiring runner, which returns immediately and drops its
+    // socket. Do not send shutdown to that same runner and wait for its reply.
+    pub(super) async fn requeue_for_admission(&self, shard: crate::model::gateway::ShardInfo) {
+        self.runners.lock().await.remove(&shard.id);
+        if !self.identify.is_closed() {
+            self.boot([shard.id, ShardId(shard.total)]);
         }
     }
 
@@ -420,6 +435,8 @@ impl Drop for ShardManager {
 }
 
 pub struct ShardManagerOptions {
+    /// Optional policy shared by the queuer and all runners.
+    pub identify_gate: Option<Arc<dyn super::IdentifyGate>>,
     pub data: Arc<RwLock<TypeMap>>,
     pub event_handlers: Vec<Arc<dyn EventHandler>>,
     pub raw_event_handlers: Vec<Arc<dyn RawEventHandler>>,

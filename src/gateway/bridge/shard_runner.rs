@@ -10,11 +10,12 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use typemap_rev::TypeMap;
 
 use super::event::ShardStageUpdateEvent;
+use super::identify::AttemptGuard;
 #[cfg(feature = "collector")]
 use super::CollectorCallback;
 #[cfg(feature = "voice")]
 use super::VoiceGatewayManager;
-use super::{ShardId, ShardManager, ShardRunnerMessage};
+use super::{IdentifyAdmission, ShardId, ShardManager, ShardRunnerMessage};
 #[cfg(feature = "cache")]
 use crate::cache::Cache;
 use crate::client::dispatch::dispatch_model;
@@ -35,6 +36,8 @@ pub struct ShardRunner {
     #[cfg(feature = "framework")]
     framework: Option<Arc<dyn Framework>>,
     manager: Arc<ShardManager>,
+    attempt: AttemptGuard,
+    resume_failures: u32,
     // channel to receive messages from the shard manager and dispatches
     runner_rx: Receiver<ShardRunnerMessage>,
     // channel to send messages to the shard runner from the shard manager
@@ -54,7 +57,10 @@ impl ShardRunner {
     pub fn new(opt: ShardRunnerOptions) -> Self {
         let (tx, rx) = mpsc::unbounded();
 
+        let attempt = opt.manager.identify.begin(opt.shard.shard_info());
         Self {
+            attempt,
+            resume_failures: 0,
             runner_rx: rx,
             runner_tx: tx,
             data: opt.data,
@@ -112,6 +118,10 @@ impl ShardRunner {
             if !self.shard.do_heartbeat().await {
                 warn!("[ShardRunner {:?}] Error heartbeating", self.shard.shard_info(),);
 
+                if matches!(self.shard.reconnection_type(), ReconnectType::Resume) {
+                    self.resume_with_retry().await?;
+                    continue;
+                }
                 self.request_restart().await;
                 return Ok(());
             }
@@ -136,36 +146,43 @@ impl ShardRunner {
                 }
             }
 
+            // Admission refusal and requeue are control flow, never generic
+            // action failures: neither may fall through to automatic RESUME.
+            if matches!(action, Some(ShardAction::Identify)) {
+                match self.manager.identify.admit(self.shard.shard_info(), &self.attempt.id) {
+                    IdentifyAdmission::Send => {},
+                    IdentifyAdmission::RequeueForAdmission => {
+                        self.attempt.retire();
+                        self.manager.requeue_for_admission(self.shard.shard_info()).await;
+                        return Ok(());
+                    },
+                    IdentifyAdmission::Refuse(reason) => {
+                        let error = GatewayError::IdentifyRefused(reason);
+                        self.manager.identify.close();
+                        self.manager.return_with_value(Err(error.clone())).await;
+                        return Err(error.into());
+                    },
+                }
+            }
             match action {
                 Some(ShardAction::Reconnect(ReconnectType::Reidentify)) => {
                     self.request_restart().await;
                     return Ok(());
                 },
                 Some(other) => {
-                    if let Err(e) = self.action(&other).await {
-                        debug!(
-                            "[ShardRunner {:?}] Reconnecting due to error performing {:?}: {:?}",
-                            self.shard.shard_info(),
-                            other,
-                            e
-                        );
+                    if let Err(error) = self.action(&other).await {
+                        // A terminal RESUME error has already been reported by
+                        // resume_with_retry. It must not enter another fallback.
+                        if matches!(other, ShardAction::Reconnect(ReconnectType::Resume)) {
+                            return Err(error);
+                        }
+                        debug!(?error, "Gateway action failed");
                         match self.shard.reconnection_type() {
                             ReconnectType::Reidentify => {
                                 self.request_restart().await;
                                 return Ok(());
                             },
-                            ReconnectType::Resume => {
-                                if let Err(why) = self.shard.resume().await {
-                                    warn!(
-                                        "[ShardRunner {:?}] Resume failed, reidentifying: {:?}",
-                                        self.shard.shard_info(),
-                                        why
-                                    );
-
-                                    self.request_restart().await;
-                                    return Ok(());
-                                }
-                            },
+                            ReconnectType::Resume => self.resume_with_retry().await?,
                         }
                     }
                 },
@@ -173,6 +190,14 @@ impl ShardRunner {
             }
 
             if let Some(event) = event {
+                match &event {
+                    Event::Ready(_) => {
+                        self.resume_failures = 0;
+                        self.manager.identify.ready(self.shard.shard_info(), &self.attempt.id);
+                    },
+                    Event::Resumed(_) => self.resume_failures = 0,
+                    _ => {},
+                }
                 #[cfg(feature = "collector")]
                 self.collectors.lock().expect("poison").retain_mut(|callback| (callback.0)(&event));
 
@@ -214,7 +239,7 @@ impl ShardRunner {
                 self.request_restart().await;
                 Ok(())
             },
-            ShardAction::Reconnect(ReconnectType::Resume) => self.shard.resume().await,
+            ShardAction::Reconnect(ReconnectType::Resume) => self.resume_with_retry().await,
             ShardAction::Heartbeat => self.shard.heartbeat().await,
             ShardAction::Identify => self.shard.identify().await,
         }
@@ -394,14 +419,7 @@ impl ShardRunner {
                 match self.shard.reconnection_type() {
                     ReconnectType::Reidentify => return Ok((None, None, false)),
                     ReconnectType::Resume => {
-                        if let Err(why) = self.shard.resume().await {
-                            warn!("Failed to resume: {:?}", why);
-
-                            // Don't spam reattempts on internet connection loss
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                            return Ok((None, None, false));
-                        }
+                        self.resume_with_retry().await?;
                     },
                 }
 
@@ -425,6 +443,8 @@ impl ShardRunner {
                 match &why {
                     Error::Gateway(
                         error @ (GatewayError::InvalidAuthentication
+                        | GatewayError::InvalidShardData
+                        | GatewayError::OverloadedShard
                         | GatewayError::InvalidGatewayIntents
                         | GatewayError::DisallowedGatewayIntents),
                     ) => {
@@ -456,8 +476,44 @@ impl ShardRunner {
         Ok((event, action, true))
     }
 
+    /// Keep resumable state through transport failures. The task-group select
+    /// cancels both connection establishment and these sleeps on terminal Stop.
+    async fn resume_with_retry(&mut self) -> Result<()> {
+        self.attempt.retire();
+        loop {
+            let seconds = match self.resume_failures {
+                0 => 0,
+                1 => 2,
+                2 => 5,
+                3 => 10,
+                _ => 30,
+            };
+            tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
+            self.resume_failures = self.resume_failures.saturating_add(1);
+            match self.shard.resume().await {
+                Ok(()) => {
+                    self.attempt = self.manager.identify.begin(self.shard.shard_info());
+                    return Ok(());
+                },
+                Err(error) if resume_transport_error(&error) => {
+                    warn!(?error, "Gateway RESUME transport failed; preserving session");
+                },
+                Err(error) => {
+                    let gateway_error = match &error {
+                        Error::Gateway(error) => error.clone(),
+                        _ => GatewayError::ReconnectFailure,
+                    };
+                    self.manager.identify.close();
+                    self.manager.return_with_value(Err(gateway_error)).await;
+                    return Err(error);
+                },
+            }
+        }
+    }
+
     #[instrument(skip(self))]
     async fn request_restart(&mut self) {
+        self.attempt.retire();
         debug!("[ShardRunner {:?}] Requesting restart", self.shard.shard_info());
 
         self.update_manager().await;
@@ -497,4 +553,25 @@ pub struct ShardRunnerOptions {
     #[cfg(feature = "cache")]
     pub cache: Arc<Cache>,
     pub http: Arc<Http>,
+}
+
+// Protocol, authentication and configuration errors are not transport outages.
+fn resume_transport_error(error: &Error) -> bool {
+    match error {
+        Error::Io(error) => error.kind() != std::io::ErrorKind::Unsupported,
+        Error::Tungstenite(
+            TungsteniteError::Io(_)
+            | TungsteniteError::Tls(_)
+            | TungsteniteError::ConnectionClosed
+            | TungsteniteError::AlreadyClosed
+            | TungsteniteError::Protocol(
+                tungstenite::error::ProtocolError::HandshakeIncomplete
+                | tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            ),
+        ) => true,
+        Error::Tungstenite(TungsteniteError::Http(response)) => {
+            response.status().is_server_error() || response.status().as_u16() == 429
+        },
+        _ => false,
+    }
 }

@@ -38,6 +38,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, instrument};
 use typemap_rev::{TypeMap, TypeMapKey};
 use url::Url;
+
 pub use self::context::Context;
 pub use self::error::Error as ClientError;
 #[cfg(feature = "gateway")]
@@ -54,7 +55,7 @@ use crate::framework::Framework;
 use crate::gateway::VoiceGatewayManager;
 use crate::gateway::{ActivityData, PresenceData};
 #[cfg(feature = "gateway")]
-use crate::gateway::{ShardManager, ShardManagerOptions};
+use crate::gateway::{IdentifyGate, ShardManager, ShardManagerOptions};
 use crate::http::Http;
 use crate::internal::prelude::*;
 #[cfg(feature = "gateway")]
@@ -79,6 +80,7 @@ pub struct ClientBuilder {
     raw_event_handlers: Vec<Arc<dyn RawEventHandler>>,
     presence: PresenceData,
     ws_proxy: Option<String>,
+    identify_gate: Option<Arc<dyn IdentifyGate>>,
 }
 
 #[cfg(feature = "gateway")]
@@ -98,6 +100,7 @@ impl ClientBuilder {
             raw_event_handlers: vec![],
             presence: PresenceData::default(),
             ws_proxy: None,
+            identify_gate: None,
         }
     }
 
@@ -164,6 +167,14 @@ impl ClientBuilder {
     /// Sets http proxy for the websocket connection.
     pub fn ws_proxy<T: Into<String>>(mut self, proxy: T) -> Self {
         self.ws_proxy = Some(proxy.into());
+        self
+    }
+
+    /// Installs admission for every fresh Gateway session, including internal retries.
+    ///
+    /// RESUME bypasses this gate. Without a gate, existing admission behaviour is preserved.
+    pub fn identify_gate(mut self, gate: Arc<dyn IdentifyGate>) -> Self {
+        self.identify_gate = Some(gate);
         self
     }
 
@@ -355,6 +366,7 @@ impl IntoFuture for ClientBuilder {
         let intents = self.intents;
         let presence = self.presence;
         let ws_proxy = self.ws_proxy;
+        let identify_gate = self.identify_gate;
 
         let mut http = self.http;
 
@@ -407,6 +419,7 @@ impl IntoFuture for ClientBuilder {
                 http: Arc::clone(&http),
                 intents,
                 presence: Some(presence),
+                identify_gate,
             });
 
             let client = Client {

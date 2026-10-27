@@ -6,13 +6,14 @@ use std::sync::OnceLock;
 use futures::channel::mpsc::UnboundedReceiver as Receiver;
 use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::time::{sleep, sleep_until, timeout, Duration, Instant};
 use tracing::{debug, info, instrument, warn};
 use typemap_rev::TypeMap;
 
 #[cfg(feature = "voice")]
 use super::VoiceGatewayManager;
 use super::{
+    IdentifyDecision,
     ShardId,
     ShardManager,
     ShardMessenger,
@@ -105,6 +106,9 @@ impl ShardQueuer {
         const TIMEOUT: Duration = Duration::from_secs(WAIT_BETWEEN_BOOTS_IN_SECONDS);
 
         loop {
+            if self.manager.identify.is_closed() {
+                return;
+            }
             match timeout(TIMEOUT, self.rx.next()).await {
                 Ok(Some(ShardQueuerMessage::Shutdown)) => {
                     debug!("[Shard Queuer] Received to shutdown.");
@@ -151,6 +155,34 @@ impl ShardQueuer {
     async fn checked_start(&mut self, id: ShardId, total: u32) {
         debug!("[Shard Queuer] Checked start for shard {} out of {}", id, total);
         self.check_last_start().await;
+
+        if let Some(gate) = &self.manager.identify.gate {
+            loop {
+                if self.manager.identify.is_closed() {
+                    return;
+                }
+                if let Some(deadline) = self.manager.identify.next_identify() {
+                    sleep_until(deadline).await;
+                }
+                let streak = self.manager.identify.streak(id);
+                match gate.before_fresh_session(ShardInfo::new(id, total), streak).await {
+                    IdentifyDecision::Proceed => break,
+                    IdentifyDecision::DeferUntil(deadline) => sleep_until(deadline).await,
+                    IdentifyDecision::Refuse(reason) => {
+                        self.manager.identify.close();
+                        self.manager
+                            .return_with_value(Err(crate::gateway::GatewayError::IdentifyRefused(
+                                reason,
+                            )))
+                            .await;
+                        return;
+                    },
+                }
+            }
+        }
+        if self.manager.identify.is_closed() {
+            return;
+        }
 
         if let Err(why) = self.start(id, total).await {
             warn!("[Shard Queuer] Err starting shard {}: {:?}", id, why);
@@ -200,12 +232,11 @@ impl ShardQueuer {
             stage: ConnectionStage::Disconnected,
         };
 
+        self.runners.lock().await.insert(id, runner_info);
         self.manager.tasks.spawn("shard_queuer::stop", async move {
             drop(Box::pin(runner.run()).await);
             debug!("[ShardRunner {:?}] Stopping", runner.shard.shard_info());
         });
-
-        self.runners.lock().await.insert(id, runner_info);
 
         Ok(())
     }

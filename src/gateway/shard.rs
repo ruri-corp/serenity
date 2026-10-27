@@ -345,6 +345,7 @@ impl Shard {
                 warn!("[{:?}] Sent invalid seq: {}.", self.info, self.seq);
 
                 self.seq = 0;
+                self.session_id = None;
             },
             Some(close_codes::RATE_LIMITED) => {
                 warn!("[{:?}] Gateway ratelimited.", self.info);
@@ -385,8 +386,7 @@ impl Shard {
             _ => {},
         }
 
-        let resume = num
-            .map_or(true, |x| x != close_codes::AUTHENTICATION_FAILED && self.session_id.is_some());
+        let resume = self.session_id.is_some();
 
         Ok(Some(if resume {
             ShardAction::Reconnect(ReconnectType::Resume)
@@ -435,11 +435,10 @@ impl Shard {
             &Ok(GatewayEvent::Hello(interval)) => {
                 debug!("[{:?}] Received a Hello; interval: {}", self.info, interval);
 
+                self.heartbeat_interval = Some(std::time::Duration::from_millis(interval));
                 if self.stage == ConnectionStage::Resuming {
                     return Ok(None);
                 }
-
-                self.heartbeat_interval = Some(std::time::Duration::from_millis(interval));
 
                 Ok(Some(if self.stage == ConnectionStage::Handshake {
                     ShardAction::Identify
@@ -452,13 +451,14 @@ impl Shard {
             &Ok(GatewayEvent::InvalidateSession(resumable)) => {
                 info!("[{:?}] Received session invalidation", self.info);
 
-                Ok(Some(if resumable {
-                    ShardAction::Reconnect(ReconnectType::Resume)
-                } else {
-                    ShardAction::Reconnect(ReconnectType::Reidentify)
-                }))
+                if !resumable {
+                    self.session_id = None;
+                }
+                Ok(Some(ShardAction::Reconnect(self.reconnection_type())))
             },
-            Ok(GatewayEvent::Reconnect) => Ok(Some(ShardAction::Reconnect(ReconnectType::Resume))),
+            Ok(GatewayEvent::Reconnect) => {
+                Ok(Some(ShardAction::Reconnect(self.reconnection_type())))
+            },
             Err(Error::Gateway(GatewayError::Closed(data))) => {
                 self.handle_gateway_closed(data.as_ref())
             },
@@ -718,6 +718,9 @@ impl Shard {
 
         self.client = self.initialize().await?;
         self.stage = ConnectionStage::Resuming;
+        self.last_heartbeat_sent = Some(Instant::now());
+        self.last_heartbeat_acknowledged = true;
+        self.last_heartbeat_ack = None;
 
         match &self.session_id {
             Some(session_id) => {

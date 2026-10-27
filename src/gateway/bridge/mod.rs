@@ -41,6 +41,7 @@
 //! [`Shard`]: crate::gateway::Shard
 
 mod event;
+mod identify;
 mod shard_manager;
 mod shard_messenger;
 mod shard_queuer;
@@ -54,6 +55,7 @@ use std::fmt;
 use std::time::Duration as StdDuration;
 
 pub use self::event::ShardStageUpdateEvent;
+pub use self::identify::{ConnectionAttemptId, IdentifyAdmission, IdentifyDecision, IdentifyGate};
 pub use self::shard_manager::{ShardManager, ShardManagerOptions};
 pub use self::shard_messenger::ShardMessenger;
 pub use self::shard_queuer::ShardQueuer;

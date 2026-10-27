@@ -188,7 +188,8 @@ impl WsClient {
         let message = match timeout(TIMEOUT, self.0.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(e))) => return Err(e.into()),
-            Ok(None) | Err(_) => return Ok(None),
+            Ok(None) => return Err(Error::Gateway(GatewayError::Closed(None))),
+            Err(_) => return Ok(None),
         };
 
         let value = match message {
@@ -215,8 +216,8 @@ impl WsClient {
 
                 why
             })?,
-            Message::Close(Some(frame)) => {
-                return Err(Error::Gateway(GatewayError::Closed(Some(frame))));
+            Message::Close(frame) => {
+                return Err(Error::Gateway(GatewayError::Closed(frame)));
             },
             _ => return Ok(None),
         };

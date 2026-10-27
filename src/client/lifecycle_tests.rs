@@ -22,6 +22,19 @@ const HANG: usize = 1;
 const GATEWAY: usize = 2;
 const REIDENTIFY: usize = 3;
 const STALL_CLOSE: usize = 4;
+const LOOP_INVALIDATION: usize = 5;
+const READY_INVALIDATION: usize = 6;
+const RESUME_OUTAGE: usize = 7;
+const INVALID_SEQUENCE: usize = 8;
+const SESSION_TIMEOUT: usize = 9;
+const RESUMABLE_INVALIDATION: usize = 10;
+const DELAY_HELLO: usize = 11;
+const CLOSE_WITHOUT_SESSION: usize = 12;
+const FATAL_AUTH: usize = 13;
+const RESUME_IO_OUTAGE: usize = 14;
+const CUT_HANDSHAKE: usize = 15;
+const FATAL_SHARD: usize = 16;
+const FATAL_SHARDING: usize = 17;
 const BUDGET: Duration = Duration::from_secs(3);
 
 struct Proxy {
@@ -29,6 +42,8 @@ struct Proxy {
     mode: Arc<AtomicUsize>,
     connects: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
+    identifies: Arc<AtomicUsize>,
+    resumes: Arc<AtomicUsize>,
     events: mpsc::UnboundedReceiver<&'static str>,
     server: JoinHandle<()>,
 }
@@ -48,8 +63,11 @@ impl Proxy {
         let mode = Arc::new(AtomicUsize::new(mode));
         let connects = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(AtomicUsize::new(0));
+        let identifies = Arc::new(AtomicUsize::new(0));
+        let resumes = Arc::new(AtomicUsize::new(0));
         let (events_tx, events) = mpsc::unbounded_channel();
         let (m, c, a) = (Arc::clone(&mode), Arc::clone(&connects), Arc::clone(&active));
+        let (ic, rc) = (Arc::clone(&identifies), Arc::clone(&resumes));
         let server = tokio::spawn(async move {
             let mut handlers = JoinSet::new();
             loop {
@@ -59,9 +77,10 @@ impl Proxy {
                         a.fetch_add(1, Ordering::SeqCst);
                         let guard = ConnectionGuard(Arc::clone(&a));
                         let (m, c, tx) = (Arc::clone(&m), Arc::clone(&c), events_tx.clone());
+                        let (ic, rc) = (Arc::clone(&ic), Arc::clone(&rc));
                         handlers.spawn(async move {
                             let _guard = guard;
-                            serve(socket, m, c, tx).await;
+                            serve(socket, m, c, ic, rc, tx).await;
                         });
                     },
                     Some(result) = handlers.join_next(), if !handlers.is_empty() => {
@@ -70,7 +89,16 @@ impl Proxy {
                 }
             }
         });
-        Self { url, mode, connects, active, events, server }
+        Self {
+            url,
+            mode,
+            connects,
+            active,
+            identifies,
+            resumes,
+            events,
+            server,
+        }
     }
 
     async fn event(&mut self, expected: &'static str) {
@@ -106,6 +134,8 @@ async fn serve(
     mut socket: TcpStream,
     mode: Arc<AtomicUsize>,
     connects: Arc<AtomicUsize>,
+    identifies: Arc<AtomicUsize>,
+    resumes: Arc<AtomicUsize>,
     events: mpsc::UnboundedSender<&'static str>,
 ) {
     let mut header = Vec::new();
@@ -131,7 +161,19 @@ async fn serve(
     if socket.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
         return;
     }
+    if behavior == CUT_HANDSHAKE {
+        // The CONNECT succeeds but the peer disappears during the WS handshake.
+        return;
+    }
     let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else { return };
+    if behavior == DELAY_HELLO {
+        sleep(Duration::from_millis(150)).await;
+    }
+    if behavior == CLOSE_WITHOUT_SESSION {
+        mode.store(GATEWAY, Ordering::SeqCst);
+        drop(ws.close(None).await);
+        return;
+    }
     if ws
         .send(Message::Text(json!({"op":10,"d":{"heartbeat_interval":60000}}).to_string()))
         .await
@@ -145,9 +187,12 @@ async fn serve(
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let response = match value["op"].as_u64() {
                     Some(2) => {
+                        identifies.fetch_add(1, Ordering::SeqCst);
                         events.send("IDENTIFY").expect("test event receiver remains alive");
-                        if behavior == REIDENTIFY {
-                            mode.store(GATEWAY, Ordering::SeqCst);
+                        if behavior == REIDENTIFY || behavior == LOOP_INVALIDATION {
+                            if behavior == REIDENTIFY {
+                                mode.store(GATEWAY, Ordering::SeqCst);
+                            }
                             json!({"op":9,"d":false})
                         } else {
                             json!({"op":0,"t":"READY","s":1,"d":{
@@ -158,11 +203,65 @@ async fn serve(
                             }})
                         }
                     },
+                    Some(6) => {
+                        assert_eq!(value["d"]["session_id"], "synthetic-session");
+                        assert_eq!(value["d"]["seq"], 1);
+                        resumes.fetch_add(1, Ordering::SeqCst);
+                        events.send("RESUME").expect("test receiver remains alive");
+                        json!({"op":0,"t":"RESUMED","s":2,"d":{}})
+                    },
                     Some(1) => json!({"op":11,"d":null}),
                     _ => continue,
                 };
                 if ws.send(Message::Text(response.to_string())).await.is_err() {
                     return;
+                }
+                if value["op"] == 2 {
+                    match behavior {
+                        READY_INVALIDATION | RESUMABLE_INVALIDATION => {
+                            let resumable = behavior == RESUMABLE_INVALIDATION;
+                            if resumable {
+                                mode.store(GATEWAY, Ordering::SeqCst);
+                            }
+                            drop(
+                                ws.send(Message::Text(json!({"op":9,"d":resumable}).to_string()))
+                                    .await,
+                            );
+                        },
+                        RESUME_IO_OUTAGE => {
+                            sleep(Duration::from_millis(100)).await;
+                            mode.store(REFUSE, Ordering::SeqCst);
+                            #[allow(deprecated)]
+                            ws.get_mut().set_linger(Some(Duration::ZERO)).unwrap();
+                            return;
+                        },
+                        RESUME_OUTAGE | INVALID_SEQUENCE | SESSION_TIMEOUT | FATAL_AUTH
+                        | FATAL_SHARD | FATAL_SHARDING => {
+                            let code = match behavior {
+                                INVALID_SEQUENCE => 4007,
+                                SESSION_TIMEOUT => 4009,
+                                FATAL_AUTH => 4004,
+                                FATAL_SHARD => 4010,
+                                FATAL_SHARDING => 4011,
+                                _ => 4000,
+                            };
+                            mode.store(
+                                if behavior == RESUME_OUTAGE { REFUSE } else { GATEWAY },
+                                Ordering::SeqCst,
+                            );
+                            drop(
+                                ws.close(Some(
+                                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                        code: code.into(),
+                                        reason: "fixture".into(),
+                                    },
+                                ))
+                                .await,
+                            );
+                            return;
+                        },
+                        _ => {},
+                    }
                 }
             },
             Message::Close(_) => {
@@ -184,6 +283,10 @@ async fn serve(
 
 /// Assemble the real Client without ClientBuilder's external GET /gateway.
 fn client(proxy: &Proxy) -> Client {
+    client_with_gate(proxy, None)
+}
+
+fn client_with_gate(proxy: &Proxy, gate: Option<Arc<dyn crate::gateway::IdentifyGate>>) -> Client {
     let data = Arc::new(RwLock::new(TypeMap::new()));
     let http = Arc::new(Http::new("synthetic.gateway.token"));
     let ws_url = Arc::new(Mutex::new("ws://gateway.invalid".to_owned()));
@@ -207,6 +310,7 @@ fn client(proxy: &Proxy) -> Client {
         http: Arc::clone(&http),
         intents: GatewayIntents::empty(),
         presence: None,
+        identify_gate: gate,
     });
     Client {
         data,
@@ -376,3 +480,6 @@ async fn websocket_connect_timeout_bounds_unanswered_proxy_connect() {
     proxy.stays_stopped().await;
     proxy.finish().await;
 }
+
+#[path = "identify_tests.rs"]
+mod identify_tests;

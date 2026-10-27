@@ -12,6 +12,8 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 pub enum Error {
     /// There was an error building a URL.
     BuildingUrl,
+    /// The configured policy refused a fresh session. This is terminal for this client.
+    IdentifyRefused(String),
     /// The connection closed, potentially uncleanly.
     Closed(Option<CloseFrame<'static>>),
     /// Expected a Hello during a handshake
@@ -55,6 +57,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IdentifyRefused(reason) => write!(f, "IDENTIFY refused: {reason}"),
             Self::BuildingUrl => f.write_str("Error building url"),
             Self::Closed(_) => f.write_str("Connection closed"),
             Self::ExpectedHello => f.write_str("Expected a Hello"),
